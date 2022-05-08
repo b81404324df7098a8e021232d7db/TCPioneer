@@ -9,11 +9,15 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"./header"
+	"github.com/Macronut/TCPioneer/header"
 	"github.com/chai2010/winsvc"
 )
 
 var ServiceMode bool = true
+var ScanIPRange string = ""
+var ScanSpeed int = 1
+var ScanURL string = ""
+var ScanTimeout uint = 0
 
 func StartService() {
 	runtime.GOMAXPROCS(1)
@@ -39,8 +43,21 @@ func StartService() {
 		return
 	}
 
+	Windir := os.Getenv("WINDIR")
+	err = tcpioneer.LoadHosts(Windir + "\\System32\\drivers\\etc\\hosts")
+	if err != nil && !ServiceMode {
+		log.Println(err)
+		return
+	}
+
 	if tcpioneer.LogLevel == 0 && !ServiceMode {
 		tcpioneer.LogLevel = 1
+	}
+
+	if ScanIPRange != "" {
+		tcpioneer.DetectEnable = true
+		tcpioneer.ScanURL = ScanURL
+		tcpioneer.ScanTimeout = ScanTimeout
 	}
 
 	tcpioneer.TCPDaemon(":443", false)
@@ -52,7 +69,7 @@ func StartService() {
 		tcpioneer.TCPDaemon(":443", true)
 		tcpioneer.TCPDaemon(":80", true)
 		tcpioneer.UDPDaemon(443, true)
-		tcpioneer.TCPRecv(443, false)
+		tcpioneer.TCPRecv(443, true)
 	}
 
 	if tcpioneer.DNS == "" {
@@ -60,6 +77,10 @@ func StartService() {
 	} else {
 		tcpioneer.TCPDaemon(tcpioneer.DNS, false)
 		tcpioneer.DNSDaemon()
+	}
+
+	if ScanIPRange != "" {
+		go tcpioneer.Scan(ScanIPRange, ScanSpeed)
 	}
 
 	fmt.Println("Service Start")
@@ -83,10 +104,15 @@ func main() {
 	var flagServiceUninstall bool
 	var flagServiceStart bool
 	var flagServiceStop bool
+
 	flag.BoolVar(&flagServiceInstall, "install", false, "Install service")
 	flag.BoolVar(&flagServiceUninstall, "remove", false, "Remove service")
 	flag.BoolVar(&flagServiceStart, "start", false, "Start service")
 	flag.BoolVar(&flagServiceStop, "stop", false, "Stop service")
+	flag.StringVar(&ScanIPRange, "scanip", "", "Scan IP Range")
+	flag.IntVar(&ScanSpeed, "scanspeed", 1, "Scan Speed")
+	flag.StringVar(&ScanURL, "scanurl", "", "Scan URL")
+	flag.UintVar(&ScanTimeout, "scantimeout", 0, "Scan Timeout")
 	flag.Parse()
 
 	appPath, err := winsvc.GetAppPath()

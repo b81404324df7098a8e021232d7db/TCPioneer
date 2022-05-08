@@ -19,6 +19,7 @@ type Config struct {
 	TTL      byte
 	MAXTTL   byte
 	MSS      uint16
+	ECS      net.IP
 	ANCount4 int16
 	ANCount6 int16
 	Answers4 []byte
@@ -32,10 +33,12 @@ type IPConfig struct {
 	MSS    uint16
 }
 
+var DefaultConfig *Config = nil
 var DomainMap map[string]Config
 var IPMap map[string]IPConfig
 var BadIPMap map[string]bool
 var wg sync.WaitGroup
+var mutex sync.Mutex
 
 var SubdomainDepth = 2
 var LogLevel = 0
@@ -44,46 +47,63 @@ var IPBlock = false
 var IPMode = false
 var TFOEnable = false
 var RSTFilterEnable = false
-var DNSFilterEnable = false
+var DetectEnable = false
+
+var ScanURL string = ""
+var ScanTimeout uint = 0
 
 const (
-	OPT_NONE   = 0x0
-	OPT_TTL    = 0x1 << 0
-	OPT_MD5    = 0x1 << 1
-	OPT_WMD5   = 0x1 << 2
-	OPT_WACK   = 0x1 << 3
-	OPT_WCSUM  = 0x1 << 4
-	OPT_BAD    = 0x1 << 5
-	OPT_IPOPT  = 0x1 << 6
-	OPT_SEQ    = 0x1 << 7
-	OPT_HTTPS  = 0x1 << 8
-	OPT_MSS    = 0x1 << 9
-	OPT_WTFO   = 0x1 << 10
-	OPT_TFO    = 0x10000 << 0
-	OPT_SYN    = 0x10000 << 1
-	OPT_NOFLAG = 0x10000 << 2
-	OPT_QUIC   = 0x10000 << 3
-	OPT_FILTER = 0x10000 << 4
+	OPT_NONE  = 0x0
+	OPT_TTL   = 0x1 << 0
+	OPT_MD5   = 0x1 << 1
+	OPT_WMD5  = 0x1 << 2
+	OPT_WACK  = 0x1 << 3
+	OPT_WCSUM = 0x1 << 4
+	OPT_BAD   = 0x1 << 5
+	OPT_IPOPT = 0x1 << 6
+	OPT_SEQ   = 0x1 << 7
+	OPT_HTTPS = 0x1 << 8
+	OPT_MSS   = 0x1 << 9
+	OPT_WTFO  = 0x1 << 10
+	OPT_WULEN = 0x1 << 11
+
+	OPT_MODE2  = 0x10000 << 0
+	OPT_DF     = 0x10000 << 1
+	OPT_TFO    = 0x10000 << 2
+	OPT_SYN    = 0x10000 << 3
+	OPT_NOFLAG = 0x10000 << 4
+	OPT_SSEG   = 0x10000 << 5
+	OPT_QUIC   = 0x10000 << 6
+	OPT_FILTER = 0x10000 << 7
+	OPT_SAT    = 0x10000 << 8
+	OPT_NORST  = 0x10000 << 9
 )
 
 var MethodMap = map[string]uint32{
-	"none":    OPT_NONE,
-	"ttl":     OPT_TTL,
-	"mss":     OPT_MSS,
-	"md5":     OPT_MD5,
-	"w-md5":   OPT_WMD5,
-	"w-ack":   OPT_WACK,
-	"w-csum":  OPT_WCSUM,
-	"bad":     OPT_BAD,
-	"ipopt":   OPT_IPOPT,
-	"seq":     OPT_SEQ,
-	"https":   OPT_HTTPS,
-	"w-tfo":   OPT_WTFO,
+	"none":   OPT_NONE,
+	"ttl":    OPT_TTL,
+	"mss":    OPT_MSS,
+	"md5":    OPT_MD5,
+	"w-md5":  OPT_WMD5,
+	"w-ack":  OPT_WACK,
+	"w-csum": OPT_WCSUM,
+	"bad":    OPT_BAD,
+	"ipopt":  OPT_IPOPT,
+	"seq":    OPT_SEQ,
+	"https":  OPT_HTTPS,
+	"w-tfo":  OPT_WTFO,
+	"w-ulen": OPT_WULEN,
+
+	"mode2":   OPT_MODE2,
+	"df":      OPT_DF,
 	"tfo":     OPT_TFO,
 	"syn":     OPT_SYN,
 	"no-flag": OPT_NOFLAG,
+	"s-seg":   OPT_SSEG,
 	"quic":    OPT_QUIC,
 	"filter":  OPT_FILTER,
+	"sat":     OPT_SAT,
+	"no-rst":  OPT_NORST,
 }
 
 var Logger *log.Logger
@@ -101,7 +121,7 @@ func domainLookup(qname string) (Config, bool) {
 	}
 
 	if SubdomainDepth == 0 {
-		return Config{0, 0, 0, 0, 0, 0, nil, nil}, true
+		return Config{0, 0, 0, 0, nil, 0, 0, nil, nil}, true
 	}
 
 	offset := 0
@@ -118,7 +138,11 @@ func domainLookup(qname string) (Config, bool) {
 		offset++
 	}
 
-	return Config{0, 0, 0, 0, 0, 0, nil, nil}, false
+	if DefaultConfig != nil {
+		return *DefaultConfig, true
+	} else {
+		return Config{0, 0, 0, 0, nil, -1, -1, nil, nil}, false
+	}
 }
 
 func IPLookup(addr string) (IPConfig, bool) {
@@ -321,16 +345,29 @@ func getSNIFromQUIC(payload []byte) string {
 func getMyIPv4() net.IP {
 	s, err := net.InterfaceAddrs()
 	if err != nil {
+		log.Println(err)
 		return nil
 	}
 	for _, a := range s {
-		strIP := strings.SplitN(a.String(), "/", 2)
-		if strIP[1] == "24" && !strings.HasSuffix(strIP[0], ".1") {
-			ip := net.ParseIP(strIP[0])
-			ip4 := ip.To4()
-			if ip4 != nil {
-				return ip4
-			}
+		ip, ipNet, err := net.ParseCIDR(a.String())
+		if err != nil {
+			log.Println(err)
+			return nil
+		}
+		myIP := ip
+		gateway := ip.Mask(ipNet.Mask)
+		if gateway.Equal(net.IPv4(169, 254, 0, 0)) {
+			continue
+		}
+
+		gateway[len(gateway)-1] += 1
+		if myIP.Equal(gateway) {
+			continue
+		}
+
+		ip4 := myIP.To4()
+		if ip4 != nil {
+			return ip4
 		}
 	}
 	return nil
@@ -359,7 +396,7 @@ func LoadConfig() error {
 	IPMap = make(map[string]IPConfig)
 	BadIPMap = make(map[string]bool)
 
-	conf, err := os.Open("config")
+	conf, err := os.Open("default.conf")
 	if err != nil {
 		return err
 	}
@@ -373,6 +410,7 @@ func LoadConfig() error {
 	var syncMSS uint16 = 0
 	ipv6Enable := true
 	ipv4Enable := true
+	var ecs net.IP = nil
 
 	for {
 		line, _, err := br.ReadLine()
@@ -403,8 +441,8 @@ func LoadConfig() error {
 						DNS = tcpAddr.String()
 						IPMap[tcpAddr.IP.String()] = IPConfig{option, minTTL, maxTTL, syncMSS}
 						logPrintln(2, string(line))
-					} else if keys[0] == "dns64" {
-						DNS64 = keys[1]
+					} else if keys[0] == "ecs" {
+						ecs = net.ParseIP(keys[1])
 						logPrintln(2, string(line))
 					} else if keys[0] == "ipv6" {
 						if keys[1] == "true" {
@@ -431,7 +469,9 @@ func LoadConfig() error {
 								case OPT_TFO:
 									TFOEnable = true
 								case OPT_FILTER:
-									DNSFilterEnable = true
+									DetectEnable = true
+								case OPT_NORST:
+									RSTFilterEnable = true
 								}
 							} else {
 								logPrintln(1, "Unsupported method: "+m)
@@ -473,38 +513,52 @@ func LoadConfig() error {
 						if err != nil {
 							log.Println(string(line), err)
 							return err
+						} else {
+							logPrintln(1, string(line))
 						}
 					} else {
 						ip := net.ParseIP(keys[0])
 						if ip == nil {
-							if strings.HasSuffix(keys[1], "::") {
+							if strings.HasSuffix(keys[1], ":") {
 								prefix := net.ParseIP(keys[1])
 								if prefix != nil {
-									DomainMap[keys[0]] = Config{option, minTTL, maxTTL, syncMSS, 0, -1, nil, prefix}
+									DomainMap[keys[0]] = Config{option, minTTL, maxTTL, syncMSS, ecs, 0, -1, nil, prefix}
 								}
 							} else {
-								ips := strings.Split(keys[1], ",")
-								for _, ip := range ips {
-									config, ok := IPMap[ip]
-									if ok {
-										option |= config.Option
-										if syncMSS == 0 {
-											syncMSS = config.MSS
-										}
+								if strings.HasPrefix(keys[1], "[") {
+									var ok bool
+									config, ok := DomainMap[keys[1][1:len(keys[1])-1]]
+									if !ok {
+										log.Println(string(line), "bad domain")
 									}
-									IPMap[ip] = IPConfig{option, minTTL, maxTTL, syncMSS}
-								}
-								count4, answer4 := packAnswers(ips, 1)
-								count6, answer6 := packAnswers(ips, 28)
+									DomainMap[keys[0]] = config
+								} else {
+									ips := strings.Split(keys[1], ",")
+									for _, ip := range ips {
+										config, ok := IPMap[ip]
+										if ok {
+											option |= config.Option
+											if syncMSS == 0 {
+												syncMSS = config.MSS
+											}
+										}
+										IPMap[ip] = IPConfig{option, minTTL, maxTTL, syncMSS}
+									}
+									count4, answer4 := packAnswers(ips, 1)
+									count6, answer6 := packAnswers(ips, 28)
 
-								if ipv4Enable && count4 == 0 {
-									count4 = -1
-								}
-								if ipv6Enable && count6 == 0 {
-									count6 = -1
-								}
+									if ipv4Enable && count4 == 0 {
+										count4 = -1
+									}
+									if ipv6Enable && count6 == 0 {
+										count6 = -1
+									}
 
-								DomainMap[keys[0]] = Config{option, minTTL, maxTTL, syncMSS, int16(count4), int16(count6), answer4, answer6}
+									DomainMap[keys[0]] = Config{option,
+										minTTL, maxTTL, syncMSS, ecs,
+										int16(count4), int16(count6),
+										answer4, answer6}
+								}
 							}
 						} else {
 							prefix := net.ParseIP(keys[1])
@@ -543,25 +597,27 @@ func LoadConfig() error {
 									IPBlock = true
 								}
 							} else {
-								var count4 int16
-								var count6 int16
-								if ipv4Enable {
-									count4 = -1
-								} else {
-									count4 = 0
-								}
-								if ipv6Enable {
-									count6 = -1
-								} else {
-									count6 = 0
-								}
-
 								ip := net.ParseIP(keys[0])
-
 								if ip != nil {
 									IPMap[keys[0]] = IPConfig{option, minTTL, maxTTL, syncMSS}
 								} else {
-									DomainMap[keys[0]] = Config{option, minTTL, maxTTL, syncMSS, count4, count6, nil, nil}
+									var count4 int16 = 0
+									var count6 int16 = 0
+									if ipv4Enable {
+										count4 = -1
+									}
+									if ipv6Enable {
+										count6 = -1
+									}
+									if keys[0] == "*" {
+										DefaultConfig = &Config{
+											option, minTTL, maxTTL, syncMSS, ecs,
+											count4, count6, nil, nil}
+									} else {
+										DomainMap[keys[0]] = Config{
+											option, minTTL, maxTTL, syncMSS, ecs,
+											count4, count6, nil, nil}
+									}
 								}
 							}
 						}
@@ -573,6 +629,41 @@ func LoadConfig() error {
 
 	if TFOEnable {
 		CookiesMap = make(map[string][]byte)
+	}
+
+	return nil
+}
+
+func LoadHosts(name string) error {
+	hosts, err := os.Open(name)
+	if err != nil {
+		return err
+	}
+	defer hosts.Close()
+
+	br := bufio.NewReader(hosts)
+
+	for {
+		line, _, err := br.ReadLine()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			logPrintln(1, err)
+		}
+
+		if len(line) == 0 || line[0] == '#' {
+			continue
+		}
+
+		keys := strings.Fields(string(line))
+		if len(keys) == 2 {
+			ip := keys[0]
+			config, ok := DomainMap[keys[1]]
+			if ok {
+				IPMap[ip] = IPConfig{config.Option, config.TTL, config.MAXTTL, config.MSS}
+			}
+		}
 	}
 
 	return nil

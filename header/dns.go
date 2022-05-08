@@ -8,7 +8,6 @@ import (
 )
 
 var DNS string = ""
-var DNS64 string = ""
 
 func TCPlookup(request []byte, address string) ([]byte, error) {
 	server, err := net.DialTimeout("tcp", address, time.Second*5)
@@ -129,6 +128,11 @@ func TCPlookupDNS64(request []byte, address string, offset int, prefix []byte) (
 			offset4 = offset
 		}
 	}
+
+	binary.BigEndian.PutUint16(response6[8:10], 0)
+	binary.BigEndian.PutUint16(response6[10:12], 0)
+	//copy(response6[offset6:], response[offset4:])
+	//offset6 += len(response) - offset4
 
 	return response6[:offset6], nil
 }
@@ -274,4 +278,62 @@ func packAnswers(ips []string, qtype int) (int, []byte) {
 	}
 
 	return count, answers
+}
+
+func AddECS(request []byte, ecs net.IP) []byte {
+	if binary.BigEndian.Uint16(request[10:12]) > 0 {
+		return request
+	}
+	request_ecs := make([]byte, 512)
+	length := len(request)
+	copy(request_ecs, request)
+	binary.BigEndian.PutUint16(request_ecs[10:], 1) //ARCount
+
+	request_ecs[length] = 0 //Name
+	length++
+	binary.BigEndian.PutUint16(request_ecs[length:], 41) // Type
+	length += 2
+	binary.BigEndian.PutUint16(request_ecs[length:], 4096) // UDP Payload
+	length += 2
+	request_ecs[length] = 0 // Highter bits in extended RCCODE
+	length++
+	request_ecs[length] = 0 // EDNS0 Version
+	length++
+	binary.BigEndian.PutUint16(request_ecs[length:], 0x800) // Z
+	length += 2
+
+	ecsip4 := ecs.To4()
+	if ecsip4 != nil {
+		binary.BigEndian.PutUint16(request_ecs[length:], 11) // Length
+		length += 2
+		binary.BigEndian.PutUint16(request_ecs[length:], 8) // Option Code
+		length += 2
+		binary.BigEndian.PutUint16(request_ecs[length:], 7) // Option Length
+		length += 2
+		binary.BigEndian.PutUint16(request_ecs[length:], 1) // Family
+		length += 2
+		request_ecs[length] = 24 // Source Netmask
+		length++
+		request_ecs[length] = 0 // Scope Netmask
+		length++
+		copy(request_ecs[length:], ecsip4[:3])
+		length += 3
+	} else {
+		binary.BigEndian.PutUint16(request_ecs[length:], 15) // Length
+		length += 2
+		binary.BigEndian.PutUint16(request_ecs[length:], 8) // Option Code
+		length += 2
+		binary.BigEndian.PutUint16(request_ecs[length:], 11) // Option Length
+		length += 2
+		binary.BigEndian.PutUint16(request_ecs[length:], 2) // Family
+		length += 2
+		request_ecs[length] = 56 // Source Netmask
+		length++
+		request_ecs[length] = 0 // Scope Netmask
+		length++
+		copy(request_ecs[length:], ecs[:7])
+		length += 7
+	}
+
+	return request_ecs[:length]
 }

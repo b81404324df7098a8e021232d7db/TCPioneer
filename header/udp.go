@@ -6,7 +6,7 @@ import (
 	"os/exec"
 	"strconv"
 
-	"github.com/williamfhe/godivert"
+	"github.com/macronut/godivert"
 )
 
 func DNSDaemon() {
@@ -23,7 +23,9 @@ func DNSDaemon() {
 	}
 
 	filter := "outbound and udp.DstPort == 53"
+	mutex.Lock()
 	winDivert, err := godivert.NewWinDivertHandle(filter)
+	mutex.Unlock()
 	if err != nil {
 		if LogLevel > 0 {
 			log.Println(err, filter)
@@ -162,18 +164,20 @@ func DNSDaemon() {
 							ipheadlen = 20
 						}
 
+						request := packet.Raw[ipheadlen+udpheadlen:]
+
+						if config.ECS != nil {
+							request = AddECS(request, config.ECS)
+						}
+
 						var response []byte
 						var err error
-						if qtype != 28 || answers6 == nil {
-							response, err = TCPlookup(packet.Raw[ipheadlen+udpheadlen:], DNS)
+						if qtype == 28 && answers6 != nil {
+							response, err = TCPlookupDNS64(request, DNS, offset, answers6)
 						} else {
-							if DNS64 == "" {
-								response, err = TCPlookupDNS64(packet.Raw[ipheadlen+udpheadlen:], DNS, offset, answers6)
-							} else {
-								response, err = TCPlookup(packet.Raw[ipheadlen+udpheadlen:], DNS64)
-								//response, err = TCPlookupDNS64(packet.Raw[ipheadlen+udpheadlen:], DNS64, offset, answers6)
-							}
+							response, err = TCPlookup(request, DNS)
 						}
+
 						if err != nil {
 							if LogLevel > 0 {
 								log.Println(err)
@@ -190,9 +194,16 @@ func DNSDaemon() {
 
 						//Filter
 						if config.Option&OPT_FILTER != 0 {
-							ips = TCPDetection(winDivert, *packet.Addr, ips, 443, int(config.TTL))
+							if qtype == 28 && ipv6 {
+								ips = TCPDetection(winDivert, *packet.Addr, rawbuf[24:40], ips, 443, int(config.TTL))
+							} else if qtype == 1 && !ipv6 {
+								ips = TCPDetection(winDivert, *packet.Addr, rawbuf[16:20], ips, 443, int(config.TTL))
+							} else {
+								ips = TCPDetection(winDivert, *packet.Addr, nil, ips, 443, int(config.TTL))
+							}
 							count, ans := packAnswers(ips, qtype)
 							binary.BigEndian.PutUint16(response[6:8], uint16(count))
+							binary.BigEndian.PutUint16(response[10:12], 0)
 							copy(response[off:], ans)
 							response = response[:off+len(ans)]
 						}
@@ -234,6 +245,7 @@ func DNSDaemon() {
 					}(int(config.Option), config.Answers6, off)
 				}
 			} else {
+				logPrintln(3, qname)
 				_, err = winDivert.Send(packet)
 			}
 		}
@@ -394,7 +406,19 @@ func UDPDaemon(dstPort int, forward bool) {
 
 			config, ok := IPLookup(packet.DstIP().String())
 			if ok {
-				if config.Option == 0 || (config.Option|OPT_QUIC != 0) {
+				if config.Option == 0 || (config.Option&OPT_QUIC != 0) {
+					if config.Option&OPT_WULEN != 0 {
+						ipv6 := packet.Raw[0]>>4 == 6
+						var ipheadlen int
+						if ipv6 {
+							ipheadlen = 40
+						} else {
+							ipheadlen = int(packet.Raw[0]&0xF) * 4
+						}
+						//ulen := binary.BigEndian.Uint16(packet.Raw[ipheadlen+udpheadlen:])
+						binary.BigEndian.PutUint16(packet.Raw[ipheadlen+4:], 0)
+						packet.CalcNewChecksum(winDivert)
+					}
 					_, err = winDivert.Send(packet)
 				}
 			} else {
